@@ -296,6 +296,20 @@ fn project_slug_hash_suffix_avoids_prefix_collisions() {
     assert_ne!(slug_dash, slug_nested);
 }
 
+#[test]
+fn project_slug_is_capped_to_filesystem_safe_component_length() {
+    let long_segment = "a".repeat(600);
+    let cwd = std::path::PathBuf::from(format!("/tmp/{long_segment}/nested"));
+    let slug = crate::rollout::project_slug_for_cwd(cwd.as_path());
+
+    assert!(slug.len() <= 255);
+    let (prefix, suffix) = slug
+        .rsplit_once("--")
+        .expect("slug should include hash separator");
+    assert!(!prefix.is_empty());
+    assert_eq!(suffix.len(), 7);
+}
+
 async fn assert_state_db_rollout_path(
     home: &Path,
     thread_id: ThreadId,

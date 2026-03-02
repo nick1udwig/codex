@@ -8,6 +8,10 @@ use uuid::Uuid;
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub const PROJECTS_SUBDIR: &str = "projects";
+const PROJECT_SLUG_MAX_COMPONENT_BYTES: usize = 255;
+const PROJECT_SLUG_HASH_LEN: usize = 7;
+const PROJECT_SLUG_SEPARATOR: &str = "--";
+const PROJECT_SLUG_FALLBACK_PREFIX: &str = "project";
 pub const INTERACTIVE_SESSION_SOURCES: &[SessionSource] =
     &[SessionSource::Cli, SessionSource::VSCode];
 
@@ -31,16 +35,27 @@ pub fn project_slug_for_cwd(cwd: &Path) -> String {
             _ => slug.push('-'),
         }
     }
-    if slug.is_empty() {
-        slug.push_str("project");
-    }
-
     // Add a short stable hash suffix to avoid collisions in the readable prefix.
     // 7 hex chars gives 28 bits of space while keeping paths concise.
     let hash_uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, normalized_cwd.as_bytes());
     let hash_hex = hash_uuid.simple().to_string();
-    let short_hash = &hash_hex[..7];
-    format!("{slug}--{short_hash}")
+    let short_hash = &hash_hex[..PROJECT_SLUG_HASH_LEN];
+
+    if slug.is_empty() {
+        slug.push_str(PROJECT_SLUG_FALLBACK_PREFIX);
+    }
+
+    let suffix_len = PROJECT_SLUG_SEPARATOR.len() + PROJECT_SLUG_HASH_LEN;
+    let max_prefix_bytes = PROJECT_SLUG_MAX_COMPONENT_BYTES.saturating_sub(suffix_len);
+    if slug.len() > max_prefix_bytes {
+        slug.truncate(max_prefix_bytes);
+        slug = slug.trim_end_matches('-').to_string();
+        if slug.is_empty() {
+            slug.push_str(PROJECT_SLUG_FALLBACK_PREFIX);
+        }
+    }
+
+    format!("{slug}{PROJECT_SLUG_SEPARATOR}{short_hash}")
 }
 
 pub fn project_sessions_root(codex_home: &Path, cwd: &Path) -> PathBuf {
