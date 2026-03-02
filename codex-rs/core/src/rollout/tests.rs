@@ -274,6 +274,13 @@ fn rollout_date_parts_extracts_directory_components() {
     );
 }
 
+#[test]
+fn project_slug_uses_path_segments() {
+    let cwd = Path::new("/tmp/workspace/demo");
+    let slug = crate::rollout::project_slug_for_cwd(cwd);
+    assert_eq!(slug, "-tmp-workspace-demo");
+}
+
 async fn assert_state_db_rollout_path(
     home: &Path,
     thread_id: ThreadId,
@@ -305,6 +312,73 @@ fn write_session_file(
         source,
         Some("test-provider"),
     )
+}
+
+fn write_project_session_file(
+    root: &Path,
+    cwd: &Path,
+    ts_str: &str,
+    uuid: Uuid,
+    num_records: usize,
+    source: Option<SessionSource>,
+) -> std::io::Result<(OffsetDateTime, Uuid)> {
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+    let dt = PrimitiveDateTime::parse(ts_str, format)
+        .unwrap()
+        .assume_utc();
+    let dir = crate::rollout::project_sessions_root(root, cwd)
+        .join(format!("{:04}", dt.year()))
+        .join(format!("{:02}", u8::from(dt.month())))
+        .join(format!("{:02}", dt.day()));
+    fs::create_dir_all(&dir)?;
+
+    let filename = format!("rollout-{ts_str}-{uuid}.jsonl");
+    let file_path = dir.join(filename);
+    let mut file = File::create(file_path)?;
+
+    let mut payload = serde_json::json!({
+        "id": uuid,
+        "timestamp": ts_str,
+        "cwd": cwd,
+        "originator": "test_originator",
+        "cli_version": "test_version",
+        "base_instructions": null,
+    });
+
+    if let Some(source) = source {
+        payload["source"] = serde_json::to_value(source).unwrap();
+    }
+    payload["model_provider"] = serde_json::Value::String("test-provider".to_string());
+
+    let meta = serde_json::json!({
+        "timestamp": ts_str,
+        "type": "session_meta",
+        "payload": payload,
+    });
+    writeln!(file, "{meta}")?;
+
+    let user_event = serde_json::json!({
+        "timestamp": ts_str,
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "Hello from user",
+            "kind": "plain"
+        }
+    });
+    writeln!(file, "{user_event}")?;
+
+    for i in 0..num_records {
+        let rec = serde_json::json!({
+            "record_type": "response",
+            "index": i
+        });
+        writeln!(file, "{rec}")?;
+    }
+    let times = FileTimes::new().set_modified(dt.into());
+    file.set_times(times)?;
+    Ok((dt, uuid))
 }
 
 fn write_session_file_with_provider(
@@ -606,6 +680,137 @@ async fn test_list_conversations_latest_first() {
     };
 
     assert_eq!(page, expected);
+}
+
+#[tokio::test]
+async fn test_list_conversations_in_project_layout() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd = Path::new("/workspace/foo");
+    let thread_uuid = Uuid::from_u128(777);
+    write_project_session_file(
+        home,
+        cwd,
+        "2025-01-03T12-00-00",
+        thread_uuid,
+        1,
+        Some(SessionSource::VSCode),
+    )
+    .unwrap();
+
+    let provider_filter = provider_vec(&[TEST_PROVIDER]);
+    let page = get_threads(
+        home,
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+
+    let expected_path = crate::rollout::project_sessions_root(home, cwd)
+        .join("2025")
+        .join("01")
+        .join("03")
+        .join(format!("rollout-2025-01-03T12-00-00-{thread_uuid}.jsonl"));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].path, expected_path);
+    assert_eq!(
+        page.items[0].thread_id,
+        Some(thread_id_from_uuid(thread_uuid))
+    );
+    assert_eq!(page.items[0].cwd, Some(cwd.to_path_buf()));
+}
+
+#[tokio::test]
+async fn test_created_at_sort_merges_legacy_and_project_roots() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let cwd_a = Path::new("/workspace/a");
+    let cwd_b = Path::new("/workspace/b");
+
+    let older_project = Uuid::from_u128(8101);
+    let newer_project = Uuid::from_u128(8102);
+    let legacy_middle = Uuid::from_u128(8103);
+
+    write_project_session_file(
+        home,
+        cwd_a,
+        "2025-01-01T09-00-00",
+        older_project,
+        1,
+        Some(SessionSource::VSCode),
+    )
+    .unwrap();
+    write_project_session_file(
+        home,
+        cwd_b,
+        "2025-01-03T09-00-00",
+        newer_project,
+        1,
+        Some(SessionSource::VSCode),
+    )
+    .unwrap();
+    write_session_file(
+        home,
+        "2025-01-02T09-00-00",
+        legacy_middle,
+        1,
+        Some(SessionSource::VSCode),
+    )
+    .unwrap();
+
+    let provider_filter = provider_vec(&[TEST_PROVIDER]);
+    let page1 = get_threads(
+        home,
+        2,
+        None,
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page1.items.len(), 2);
+    let expected_newer = crate::rollout::project_sessions_root(home, cwd_b)
+        .join("2025")
+        .join("01")
+        .join("03")
+        .join(format!("rollout-2025-01-03T09-00-00-{newer_project}.jsonl"));
+    let expected_middle = home
+        .join("sessions")
+        .join("2025")
+        .join("01")
+        .join("02")
+        .join(format!("rollout-2025-01-02T09-00-00-{legacy_middle}.jsonl"));
+    assert_eq!(page1.items[0].path, expected_newer);
+    assert_eq!(page1.items[1].path, expected_middle);
+    assert!(page1.next_cursor.is_some());
+
+    let page2 = get_threads(
+        home,
+        2,
+        page1.next_cursor.as_ref(),
+        ThreadSortKey::CreatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        TEST_PROVIDER,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(page2.items.len(), 1);
+    let expected_older = crate::rollout::project_sessions_root(home, cwd_a)
+        .join("2025")
+        .join("01")
+        .join("01")
+        .join(format!("rollout-2025-01-01T09-00-00-{older_project}.jsonl"));
+    assert_eq!(page2.items[0].path, expected_older);
 }
 
 #[tokio::test]

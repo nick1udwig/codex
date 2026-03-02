@@ -2480,7 +2480,16 @@ impl CodexMessageProcessor {
             };
 
             let sessions_folder = self.config.codex_home.join(codex_core::SESSIONS_SUBDIR);
-            let dest_dir = sessions_folder.join(year).join(month).join(day);
+            let dest_root = codex_core::read_session_meta_line(canonical_rollout_path.as_path())
+                .await
+                .map(|meta_line| {
+                    codex_core::project_sessions_root(
+                        self.config.codex_home.as_path(),
+                        meta_line.meta.cwd.as_path(),
+                    )
+                })
+                .unwrap_or(sessions_folder);
+            let dest_dir = dest_root.join(year).join(month).join(day);
             let restored_path = dest_dir.join(&file_name);
             tokio::fs::create_dir_all(&dest_dir)
                 .await

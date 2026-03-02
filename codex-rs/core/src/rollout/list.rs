@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ffi::OsStr;
 use std::io::{self};
 use std::num::NonZero;
@@ -14,6 +15,7 @@ use time::macros::format_description;
 use uuid::Uuid;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
+use super::PROJECTS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use crate::protocol::EventMsg;
 use crate::state_db;
@@ -376,7 +378,9 @@ pub(crate) async fn get_threads_in_root(
 
 /// Load thread file paths from disk using directory traversal.
 ///
-/// Directory layout: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`
+/// Supported layouts:
+/// - Legacy: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`
+/// - Project: `~/.codex/sessions/projects/<project>/YYYY/MM/DD/rollout-...jsonl`
 /// Returned newest (based on sort key) first.
 async fn traverse_directories_for_paths(
     root: PathBuf,
@@ -752,53 +756,6 @@ async fn build_thread_item(
     None
 }
 
-/// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
-/// and returns them sorted descending by the parsed key.
-async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
-where
-    T: Ord + Copy,
-    F: Fn(&str) -> Option<T>,
-{
-    let mut dir = tokio::fs::read_dir(parent).await?;
-    let mut vec: Vec<(T, PathBuf)> = Vec::new();
-    while let Some(entry) = dir.next_entry().await? {
-        if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false)
-            && let Some(s) = entry.file_name().to_str()
-            && let Some(v) = parse(s)
-        {
-            vec.push((v, entry.path()));
-        }
-    }
-    vec.sort_by_key(|(v, _)| Reverse(*v));
-    Ok(vec)
-}
-
-/// Collects files in a directory and parses them with `parse`.
-async fn collect_files<T, F>(parent: &Path, parse: F) -> io::Result<Vec<T>>
-where
-    F: Fn(&str, &Path) -> Option<T>,
-{
-    let mut dir = tokio::fs::read_dir(parent).await?;
-    let mut collected: Vec<T> = Vec::new();
-    while let Some(entry) = dir.next_entry().await? {
-        if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-            && let Some(s) = entry.file_name().to_str()
-            && let Some(v) = parse(s, &entry.path())
-        {
-            collected.push(v);
-        }
-    }
-    Ok(collected)
-}
-
 async fn collect_flat_rollout_files(
     root: &Path,
     scanned_files: &mut usize,
@@ -835,22 +792,6 @@ async fn collect_flat_rollout_files(
     }
     collected.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
     Ok(collected)
-}
-
-async fn collect_rollout_day_files(
-    day_path: &Path,
-) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
-    let mut day_files = collect_files(day_path, |name_str, path| {
-        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-            return None;
-        }
-
-        parse_timestamp_uuid_from_filename(name_str).map(|(ts, id)| (ts, id, path.to_path_buf()))
-    })
-    .await?;
-    // Stable ordering within the same second: (timestamp desc, uuid desc)
-    day_files.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
-    Ok(day_files)
 }
 
 pub(crate) fn parse_timestamp_uuid_from_filename(name: &str) -> Option<(OffsetDateTime, Uuid)> {
@@ -937,39 +878,208 @@ async fn walk_rollout_files(
     scanned_files: &mut usize,
     visitor: &mut impl RolloutFileVisitor,
 ) -> io::Result<()> {
-    let year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
+    let mut cursors: Vec<NestedTimelineCursor> = Vec::new();
+    let mut frontier: BinaryHeap<TimelineCandidate> = BinaryHeap::new();
 
-    'outer: for (_year, year_path) in year_dirs.iter() {
+    let mut timeline_roots: Vec<PathBuf> = vec![root.to_path_buf()];
+    timeline_roots.extend(collect_project_timeline_roots(root).await?);
+
+    for timeline_root in timeline_roots {
+        if !timeline_root.exists() {
+            continue;
+        }
+
+        let mut cursor = NestedTimelineCursor::new(timeline_root).await?;
+        let root_idx = cursors.len();
+        if let Some((ts, id, path)) = cursor.next().await? {
+            frontier.push(TimelineCandidate {
+                ts,
+                id,
+                root_idx,
+                path,
+            });
+        }
+        cursors.push(cursor);
+    }
+
+    while let Some(candidate) = frontier.pop() {
         if *scanned_files >= MAX_SCAN_FILES {
             break;
         }
-        let month_dirs = collect_dirs_desc(year_path, |s| s.parse::<u8>().ok()).await?;
-        for (_month, month_path) in month_dirs.iter() {
-            if *scanned_files >= MAX_SCAN_FILES {
-                break 'outer;
+
+        *scanned_files += 1;
+        if let ControlFlow::Break(()) = visitor
+            .visit(candidate.ts, candidate.id, candidate.path, *scanned_files)
+            .await
+        {
+            break;
+        }
+
+        if let Some((ts, id, path)) = cursors[candidate.root_idx].next().await? {
+            frontier.push(TimelineCandidate {
+                ts,
+                id,
+                root_idx: candidate.root_idx,
+                path,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TimelineCandidate {
+    ts: OffsetDateTime,
+    id: Uuid,
+    root_idx: usize,
+    path: PathBuf,
+}
+
+impl Ord for TimelineCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.ts, self.id, self.root_idx).cmp(&(other.ts, other.id, other.root_idx))
+    }
+}
+
+impl PartialOrd for TimelineCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct NestedTimelineCursor {
+    day_dirs: Vec<PathBuf>,
+    next_day_idx: usize,
+    day_files: Vec<(OffsetDateTime, Uuid, PathBuf)>,
+    next_file_idx: usize,
+}
+
+impl NestedTimelineCursor {
+    async fn new(root: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            day_dirs: collect_nested_day_dirs_desc(root.as_path()).await?,
+            next_day_idx: 0,
+            day_files: Vec::new(),
+            next_file_idx: 0,
+        })
+    }
+
+    async fn next(&mut self) -> io::Result<Option<(OffsetDateTime, Uuid, PathBuf)>> {
+        loop {
+            if self.next_file_idx < self.day_files.len() {
+                let item = self.day_files[self.next_file_idx].clone();
+                self.next_file_idx += 1;
+                return Ok(Some(item));
             }
-            let day_dirs = collect_dirs_desc(month_path, |s| s.parse::<u8>().ok()).await?;
-            for (_day, day_path) in day_dirs.iter() {
-                if *scanned_files >= MAX_SCAN_FILES {
-                    break 'outer;
-                }
-                let day_files = collect_rollout_day_files(day_path).await?;
-                for (ts, id, path) in day_files.into_iter() {
-                    *scanned_files += 1;
-                    if *scanned_files > MAX_SCAN_FILES {
-                        break 'outer;
-                    }
-                    if let ControlFlow::Break(()) =
-                        visitor.visit(ts, id, path, *scanned_files).await
-                    {
-                        break 'outer;
-                    }
-                }
+
+            if self.next_day_idx >= self.day_dirs.len() {
+                return Ok(None);
+            }
+
+            self.day_files =
+                collect_rollout_day_files(self.day_dirs[self.next_day_idx].as_path()).await?;
+            self.next_day_idx += 1;
+            self.next_file_idx = 0;
+        }
+    }
+}
+
+async fn collect_project_timeline_roots(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let projects_root = root.join(PROJECTS_SUBDIR);
+    if !projects_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut dir = tokio::fs::read_dir(&projects_root).await?;
+    let mut project_roots: Vec<PathBuf> = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        if entry
+            .file_type()
+            .await
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            project_roots.push(entry.path());
+        }
+    }
+    Ok(project_roots)
+}
+
+async fn collect_nested_day_dirs_desc(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
+    let mut day_dirs = Vec::new();
+    for (_year, year_path) in year_dirs {
+        let month_dirs = collect_dirs_desc(year_path.as_path(), |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs {
+            let days = collect_dirs_desc(month_path.as_path(), |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in days {
+                day_dirs.push(day_path);
             }
         }
     }
+    Ok(day_dirs)
+}
 
-    Ok(())
+/// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
+/// and returns them sorted descending by the parsed key.
+async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
+where
+    T: Ord + Copy,
+    F: Fn(&str) -> Option<T>,
+{
+    let mut dir = tokio::fs::read_dir(parent).await?;
+    let mut vec: Vec<(T, PathBuf)> = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+            && let Some(s) = entry.file_name().to_str()
+            && let Some(v) = parse(s)
+        {
+            vec.push((v, entry.path()));
+        }
+    }
+    vec.sort_by_key(|(v, _)| Reverse(*v));
+    Ok(vec)
+}
+
+/// Collects files in a directory and parses them with `parse`.
+async fn collect_files<T, F>(parent: &Path, parse: F) -> io::Result<Vec<T>>
+where
+    F: Fn(&str, &Path) -> Option<T>,
+{
+    let mut dir = tokio::fs::read_dir(parent).await?;
+    let mut collected: Vec<T> = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_file())
+            .unwrap_or(false)
+            && let Some(s) = entry.file_name().to_str()
+            && let Some(v) = parse(s, &entry.path())
+        {
+            collected.push(v);
+        }
+    }
+    Ok(collected)
+}
+
+async fn collect_rollout_day_files(
+    day_path: &Path,
+) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
+    let mut day_files = collect_files(day_path, |name_str, path| {
+        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
+            return None;
+        }
+
+        parse_timestamp_uuid_from_filename(name_str).map(|(ts, id)| (ts, id, path.to_path_buf()))
+    })
+    .await?;
+    day_files.sort_by_key(|(ts, sid, _)| (Reverse(*ts), Reverse(*sid)));
+    Ok(day_files)
 }
 
 struct ProviderMatcher<'a> {

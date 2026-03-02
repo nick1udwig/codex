@@ -11,6 +11,8 @@ use codex_core::config::ConfigBuilder;
 use codex_core::find_archived_thread_path_by_id_str;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
+use codex_core::find_thread_path_by_name_str_in_cwd;
+use codex_core::project_sessions_root;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::SessionSource;
@@ -25,8 +27,11 @@ use uuid::Uuid;
 fn write_minimal_rollout_with_id_in_subdir(codex_home: &Path, subdir: &str, id: Uuid) -> PathBuf {
     let sessions = codex_home.join(subdir).join("2024/01/01");
     std::fs::create_dir_all(&sessions).unwrap();
+    write_minimal_rollout_with_id_at(sessions.as_path(), id, Path::new("."))
+}
 
-    let file = sessions.join(format!("rollout-2024-01-01T00-00-00-{id}.jsonl"));
+fn write_minimal_rollout_with_id_at(dir: &Path, id: Uuid, cwd: &Path) -> PathBuf {
+    let file = dir.join(format!("rollout-2024-01-01T00-00-00-{id}.jsonl"));
     let mut f = std::fs::File::create(&file).unwrap();
     // Minimal first line: session_meta with the id so content search can find it
     writeln!(
@@ -38,7 +43,7 @@ fn write_minimal_rollout_with_id_in_subdir(codex_home: &Path, subdir: &str, id: 
             "payload": {
                 "id": id,
                 "timestamp": "2024-01-01T00:00:00Z",
-                "cwd": ".",
+                "cwd": cwd,
                 "originator": "test",
                 "cli_version": "test",
                 "model_provider": "test-provider"
@@ -201,6 +206,67 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
     let contents = std::fs::read_to_string(&path)?;
     assert!(contents.contains(&thread_id.to_string()));
     recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_name_in_cwd_prefers_project_session_index() -> std::io::Result<()> {
+    let home = TempDir::new().unwrap();
+    let thread_name = "shared-name";
+
+    let cwd_a = home.path().join("workspace-a");
+    let cwd_b = home.path().join("workspace-b");
+    std::fs::create_dir_all(&cwd_a)?;
+    std::fs::create_dir_all(&cwd_b)?;
+
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+
+    let dir_a = project_sessions_root(home.path(), cwd_a.as_path()).join("2024/01/01");
+    let dir_b = project_sessions_root(home.path(), cwd_b.as_path()).join("2024/01/01");
+    std::fs::create_dir_all(&dir_a)?;
+    std::fs::create_dir_all(&dir_b)?;
+
+    let rollout_a = write_minimal_rollout_with_id_at(dir_a.as_path(), id_a, cwd_a.as_path());
+    let _rollout_b = write_minimal_rollout_with_id_at(dir_b.as_path(), id_b, cwd_b.as_path());
+
+    // Global index newest entry points to workspace-b.
+    let global_index = home.path().join("session_index.jsonl");
+    std::fs::write(
+        &global_index,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "id": id_a,
+                "thread_name": thread_name,
+                "updated_at": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "id": id_b,
+                "thread_name": thread_name,
+                "updated_at": "2024-01-02T00:00:00Z"
+            })
+        ),
+    )?;
+
+    let project_index =
+        project_sessions_root(home.path(), cwd_a.as_path()).join("session_index.jsonl");
+    std::fs::write(
+        &project_index,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": id_a,
+                "thread_name": thread_name,
+                "updated_at": "2024-01-03T00:00:00Z"
+            })
+        ),
+    )?;
+
+    let found = find_thread_path_by_name_str_in_cwd(home.path(), cwd_a.as_path(), thread_name)
+        .await?
+        .expect("expected project-scoped name lookup to find a rollout");
+    assert_eq!(found, rollout_a);
     Ok(())
 }
 

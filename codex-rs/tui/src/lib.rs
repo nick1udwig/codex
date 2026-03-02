@@ -28,6 +28,7 @@ use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
+use codex_core::find_thread_path_by_name_str_in_cwd;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
@@ -666,8 +667,15 @@ async fn run_ratatui_app(
             let is_uuid = Uuid::parse_str(id_str).is_ok();
             let path = if is_uuid {
                 find_thread_path_by_id_str(&config.codex_home, id_str).await?
-            } else {
+            } else if cli.fork_show_all {
                 find_thread_path_by_name_str(&config.codex_home, id_str).await?
+            } else {
+                find_thread_path_by_name_str_in_cwd(
+                    &config.codex_home,
+                    config.cwd.as_path(),
+                    id_str,
+                )
+                .await?
             };
             match path {
                 Some(path) => {
@@ -687,7 +695,12 @@ async fn run_ratatui_app(
             }
         } else if cli.fork_last {
             let provider_filter = vec![config.model_provider_id.clone()];
-            match RolloutRecorder::list_threads(
+            let filter_cwd = if cli.fork_show_all {
+                None
+            } else {
+                Some(config.cwd.as_path())
+            };
+            match RolloutRecorder::find_latest_thread_path(
                 &config,
                 1,
                 None,
@@ -695,42 +708,38 @@ async fn run_ratatui_app(
                 INTERACTIVE_SESSION_SOURCES,
                 Some(provider_filter.as_slice()),
                 &config.model_provider_id,
-                None,
+                filter_cwd,
             )
             .await
             {
-                Ok(page) => match page.items.first() {
-                    Some(item) => {
-                        match resolve_session_thread_id(item.path.as_path(), None).await {
-                            Some(thread_id) => resume_picker::SessionSelection::Fork(
-                                resume_picker::SessionTarget {
-                                    path: item.path.clone(),
-                                    thread_id,
-                                },
-                            ),
-                            None => {
-                                let rollout_path = item.path.display();
-                                error!(
-                                    "Error reading session metadata from latest rollout: {rollout_path}"
-                                );
-                                restore();
-                                session_log::log_session_end();
-                                let _ = tui.terminal.clear();
-                                return Ok(AppExitInfo {
-                                    token_usage: codex_protocol::protocol::TokenUsage::default(),
-                                    thread_id: None,
-                                    thread_name: None,
-                                    update_action: None,
-                                    exit_reason: ExitReason::Fatal(format!(
-                                        "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex fork` to choose from existing sessions."
-                                    )),
-                                });
-                            }
-                        }
+                Ok(Some(path)) => match resolve_session_thread_id(path.as_path(), None).await {
+                    Some(thread_id) => {
+                        resume_picker::SessionSelection::Fork(resume_picker::SessionTarget {
+                            path,
+                            thread_id,
+                        })
                     }
-                    None => resume_picker::SessionSelection::StartFresh,
+                    None => {
+                        let rollout_path = path.display();
+                        error!(
+                            "Error reading session metadata from latest rollout: {rollout_path}"
+                        );
+                        restore();
+                        session_log::log_session_end();
+                        let _ = tui.terminal.clear();
+                        return Ok(AppExitInfo {
+                            token_usage: codex_protocol::protocol::TokenUsage::default(),
+                            thread_id: None,
+                            thread_name: None,
+                            update_action: None,
+                            exit_reason: ExitReason::Fatal(format!(
+                                "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex fork` to choose from existing sessions."
+                            )),
+                        });
+                    }
                 },
                 Err(_) => resume_picker::SessionSelection::StartFresh,
+                Ok(None) => resume_picker::SessionSelection::StartFresh,
             }
         } else if cli.fork_picker {
             match resume_picker::run_fork_picker(&mut tui, &config, cli.fork_show_all).await? {
@@ -754,8 +763,11 @@ async fn run_ratatui_app(
         let is_uuid = Uuid::parse_str(id_str).is_ok();
         let path = if is_uuid {
             find_thread_path_by_id_str(&config.codex_home, id_str).await?
-        } else {
+        } else if cli.resume_show_all {
             find_thread_path_by_name_str(&config.codex_home, id_str).await?
+        } else {
+            find_thread_path_by_name_str_in_cwd(&config.codex_home, config.cwd.as_path(), id_str)
+                .await?
         };
         match path {
             Some(path) => {

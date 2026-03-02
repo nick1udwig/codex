@@ -4442,8 +4442,10 @@ mod handlers {
     /// Persists the thread name in the session index, updates in-memory state, and emits
     /// a `ThreadNameUpdated` event on success.
     ///
-    /// This appends the name to `CODEX_HOME/sessions_index.jsonl` via `session_index::append_thread_name` for the
-    /// current `thread_id`, then updates `SessionConfiguration::thread_name`.
+    /// This appends the name to `CODEX_HOME/session_index.jsonl` and the current project's
+    /// `CODEX_HOME/sessions/projects/<project>/session_index.jsonl` via
+    /// `session_index::append_thread_name` for the current `thread_id`, then updates
+    /// `SessionConfiguration::thread_name`.
     ///
     /// Returns an error event if the name is empty or session persistence is disabled.
     pub async fn set_thread_name(sess: &Arc<Session>, sub_id: String, name: String) {
@@ -4476,8 +4478,17 @@ mod handlers {
         };
 
         let codex_home = sess.codex_home().await;
-        if let Err(e) =
-            session_index::append_thread_name(&codex_home, sess.conversation_id, &name).await
+        let session_cwd = {
+            let state = sess.state.lock().await;
+            state.session_configuration.cwd.clone()
+        };
+        if let Err(e) = session_index::append_thread_name(
+            &codex_home,
+            &session_cwd,
+            sess.conversation_id,
+            &name,
+        )
+        .await
         {
             let event = Event {
                 id: sub_id,

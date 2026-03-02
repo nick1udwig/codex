@@ -24,7 +24,6 @@ use tracing::trace;
 use tracing::warn;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
-use super::SESSIONS_SUBDIR;
 use super::list::Cursor;
 use super::list::ThreadItem;
 use super::list::ThreadListConfig;
@@ -63,8 +62,8 @@ use codex_state::ThreadMetadataBuilder;
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
 ///
 /// ```ignore
-/// $ jq -C . ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
-/// $ fx ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
+/// $ jq -C . ~/.codex/sessions/projects/-root-git-codex/2025/05/07/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
+/// $ fx ~/.codex/sessions/projects/-root-git-codex/2025/05/07/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
 /// ```
 #[derive(Clone)]
 pub struct RolloutRecorder {
@@ -661,11 +660,10 @@ fn precompute_log_file_info(
     config: &Config,
     conversation_id: ThreadId,
 ) -> std::io::Result<LogFileInfo> {
-    // Resolve ~/.codex/sessions/YYYY/MM/DD path.
+    // Resolve ~/.codex/sessions/projects/<project>/YYYY/MM/DD path.
     let timestamp = OffsetDateTime::now_local()
         .map_err(|e| IoError::other(format!("failed to get local time: {e}")))?;
-    let mut dir = config.codex_home.clone();
-    dir.push(SESSIONS_SUBDIR);
+    let mut dir = super::project_sessions_root(config.codex_home.as_path(), config.cwd.as_path());
     dir.push(timestamp.year().to_string());
     dir.push(format!("{:02}", u8::from(timestamp.month())));
     dir.push(format!("{:02}", timestamp.day()));

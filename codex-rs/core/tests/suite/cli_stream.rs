@@ -256,14 +256,15 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(
-        comps.len(),
-        4,
-        "Expected sessions/YYYY/MM/DD/<file>, got {rel:?}"
-    );
-    let year = &comps[0];
-    let month = &comps[1];
-    let day = &comps[2];
+    let (year, month, day) = match comps.as_slice() {
+        [year, month, day, _file] => (year, month, day),
+        [projects, _project, year, month, day, _file] if projects == "projects" => {
+            (year, month, day)
+        }
+        _ => panic!(
+            "Expected sessions/YYYY/MM/DD/<file> or sessions/projects/<project>/YYYY/MM/DD/<file>, got {rel:?}"
+        ),
+    };
     assert!(
         year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()),
         "Year dir not 4-digit numeric: {year}"

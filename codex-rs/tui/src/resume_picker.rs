@@ -149,7 +149,7 @@ async fn run_session_picker(
     let filter_cwd = if show_all {
         None
     } else {
-        std::env::current_dir().ok()
+        Some(config.cwd.clone())
     };
 
     let config = config.clone();

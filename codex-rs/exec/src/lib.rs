@@ -73,6 +73,7 @@ use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
+use codex_core::find_thread_path_by_name_str_in_cwd;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
@@ -752,7 +753,16 @@ async fn resolve_resume_path(
             let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
             Ok(path)
         } else {
-            let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;
+            let path = if args.all {
+                find_thread_path_by_name_str(&config.codex_home, id_str).await?
+            } else {
+                find_thread_path_by_name_str_in_cwd(
+                    &config.codex_home,
+                    config.cwd.as_path(),
+                    id_str,
+                )
+                .await?
+            };
             Ok(path)
         }
     } else {

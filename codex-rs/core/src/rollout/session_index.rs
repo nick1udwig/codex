@@ -7,6 +7,7 @@ use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::path_utils;
 use codex_protocol::ThreadId;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,6 +28,7 @@ pub struct SessionIndexEntry {
 /// The index is append-only; the most recent entry wins when resolving names or ids.
 pub async fn append_thread_name(
     codex_home: &Path,
+    cwd: &Path,
     thread_id: ThreadId,
     name: &str,
 ) -> std::io::Result<()> {
@@ -41,7 +43,8 @@ pub async fn append_thread_name(
         thread_name: name.to_string(),
         updated_at,
     };
-    append_session_index_entry(codex_home, &entry).await
+    append_session_index_entry(codex_home, &entry).await?;
+    append_project_session_index_entry(codex_home, cwd, &entry).await
 }
 
 /// Append a raw session index entry to `session_index.jsonl`.
@@ -51,6 +54,24 @@ pub async fn append_session_index_entry(
     entry: &SessionIndexEntry,
 ) -> std::io::Result<()> {
     let path = session_index_path(codex_home);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    line.push('\n');
+    file.write_all(line.as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+pub async fn append_project_session_index_entry(
+    codex_home: &Path,
+    cwd: &Path,
+    entry: &SessionIndexEntry,
+) -> std::io::Result<()> {
+    let path = project_session_index_path(codex_home, cwd);
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -130,6 +151,54 @@ pub async fn find_thread_id_by_name(
     Ok(entry.map(|entry| entry.id))
 }
 
+pub async fn find_thread_id_by_name_in_cwd(
+    codex_home: &Path,
+    cwd: &Path,
+    name: &str,
+) -> std::io::Result<Option<ThreadId>> {
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let project_path = project_session_index_path(codex_home, cwd);
+    if project_path.exists() {
+        let project_name = name.to_string();
+        let project_entry = tokio::task::spawn_blocking(move || {
+            scan_index_from_end_by_name(&project_path, &project_name)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        if let Some(entry) = project_entry {
+            return Ok(Some(entry.id));
+        }
+    }
+
+    let Some(thread_id) = find_thread_id_by_name(codex_home, name).await? else {
+        return Ok(None);
+    };
+    let Some(path) =
+        super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await?
+    else {
+        return Ok(None);
+    };
+    let matches_cwd = super::list::read_session_meta_line(path.as_path())
+        .await
+        .map(|meta| {
+            let expected = path_utils::normalize_for_path_comparison(cwd)
+                .unwrap_or_else(|_| cwd.to_path_buf());
+            let actual_cwd = meta.meta.cwd;
+            let actual = path_utils::normalize_for_path_comparison(actual_cwd.as_path())
+                .unwrap_or(actual_cwd);
+            actual == expected
+        })
+        .unwrap_or(false);
+    if matches_cwd {
+        Ok(Some(thread_id))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Locate a recorded thread rollout file by thread name using newest-first ordering.
 /// Returns `Ok(Some(path))` if found, `Ok(None)` if not present.
 pub async fn find_thread_path_by_name_str(
@@ -142,8 +211,23 @@ pub async fn find_thread_path_by_name_str(
     super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await
 }
 
+pub async fn find_thread_path_by_name_str_in_cwd(
+    codex_home: &Path,
+    cwd: &Path,
+    name: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(thread_id) = find_thread_id_by_name_in_cwd(codex_home, cwd, name).await? else {
+        return Ok(None);
+    };
+    super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await
+}
+
 fn session_index_path(codex_home: &Path) -> PathBuf {
     codex_home.join(SESSION_INDEX_FILE)
+}
+
+fn project_session_index_path(codex_home: &Path, cwd: &Path) -> PathBuf {
+    super::project_sessions_root(codex_home, cwd).join(SESSION_INDEX_FILE)
 }
 
 fn scan_index_from_end_by_id(
