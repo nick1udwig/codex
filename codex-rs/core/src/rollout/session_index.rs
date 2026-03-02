@@ -176,30 +176,54 @@ pub async fn find_thread_id_by_name_in_cwd(
         }
     }
 
-    let Some(thread_id) = find_thread_id_by_name(codex_home, name).await? else {
+    let path = session_index_path(codex_home);
+    if !path.exists() {
         return Ok(None);
-    };
-    let Some(path) =
-        super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await?
-    else {
-        return Ok(None);
-    };
-    let matches_cwd = super::list::read_session_meta_line(path.as_path())
-        .await
-        .map(|meta| {
-            let expected = path_utils::normalize_for_path_comparison(cwd)
-                .unwrap_or_else(|_| cwd.to_path_buf());
-            let actual_cwd = meta.meta.cwd;
-            let actual = path_utils::normalize_for_path_comparison(actual_cwd.as_path())
-                .unwrap_or(actual_cwd);
-            actual == expected
-        })
-        .unwrap_or(false);
-    if matches_cwd {
-        Ok(Some(thread_id))
-    } else {
-        Ok(None)
     }
+
+    let file = tokio::fs::File::open(&path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut candidate_ids: Vec<ThreadId> = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
+            continue;
+        };
+        if entry.thread_name == name {
+            candidate_ids.push(entry.id);
+        }
+    }
+    if candidate_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let expected =
+        path_utils::normalize_for_path_comparison(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    for thread_id in candidate_ids.into_iter().rev() {
+        let Some(rollout_path) =
+            super::list::find_thread_path_by_id_str(codex_home, &thread_id.to_string()).await?
+        else {
+            continue;
+        };
+        let matches_cwd = super::list::read_session_meta_line(rollout_path.as_path())
+            .await
+            .map(|meta| {
+                let actual_cwd = meta.meta.cwd;
+                let actual = path_utils::normalize_for_path_comparison(actual_cwd.as_path())
+                    .unwrap_or(actual_cwd);
+                actual == expected
+            })
+            .unwrap_or(false);
+        if matches_cwd {
+            return Ok(Some(thread_id));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Locate a recorded thread rollout file by thread name using newest-first ordering.
