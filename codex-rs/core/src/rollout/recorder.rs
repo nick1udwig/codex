@@ -305,48 +305,18 @@ impl RolloutRecorder {
         default_provider: &str,
         filter_cwd: Option<&Path>,
     ) -> std::io::Result<Option<PathBuf>> {
-        let codex_home = config.codex_home.as_path();
-        let state_db_ctx = state_db::get_state_db(config, None).await;
-        if state_db_ctx.is_some() {
-            let mut db_cursor = cursor.cloned();
-            loop {
-                let Some(db_page) = state_db::list_threads_db(
-                    state_db_ctx.as_deref(),
-                    codex_home,
-                    page_size,
-                    db_cursor.as_ref(),
-                    sort_key,
-                    allowed_sources,
-                    model_providers,
-                    false,
-                    None,
-                )
-                .await
-                else {
-                    break;
-                };
-                if let Some(path) =
-                    select_resume_path_from_db_page(&db_page, filter_cwd, default_provider).await
-                {
-                    return Ok(Some(path));
-                }
-                db_cursor = db_page.next_anchor.map(Into::into);
-                if db_cursor.is_none() {
-                    break;
-                }
-            }
-        }
-
         let mut cursor = cursor.cloned();
         loop {
-            let page = get_threads(
-                codex_home,
+            let page = Self::list_threads_with_db_fallback(
+                config,
                 page_size,
                 cursor.as_ref(),
                 sort_key,
                 allowed_sources,
                 model_providers,
                 default_provider,
+                false,
+                None,
             )
             .await?;
             if let Some(path) = select_resume_path(&page, filter_cwd, default_provider).await {
@@ -1023,31 +993,6 @@ async fn resume_candidate_matches_cwd(
         .is_ok_and(|outcome| cwd_matches(outcome.metadata.cwd.as_path(), cwd))
 }
 
-async fn select_resume_path_from_db_page(
-    page: &codex_state::ThreadsPage,
-    filter_cwd: Option<&Path>,
-    default_provider: &str,
-) -> Option<PathBuf> {
-    match filter_cwd {
-        Some(cwd) => {
-            for item in &page.items {
-                if resume_candidate_matches_cwd(
-                    item.rollout_path.as_path(),
-                    Some(item.cwd.as_path()),
-                    cwd,
-                    default_provider,
-                )
-                .await
-                {
-                    return Some(item.rollout_path.clone());
-                }
-            }
-            None
-        }
-        None => page.items.first().map(|item| item.rollout_path.clone()),
-    }
-}
-
 fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool {
     if let (Ok(ca), Ok(cb)) = (
         path_utils::normalize_for_path_comparison(session_cwd),
@@ -1376,6 +1321,94 @@ mod tests {
             .await
             .expect("state db lookup should succeed");
         assert_eq!(repaired_path, Some(real_path));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_latest_thread_path_db_enabled_skips_stale_latest_row() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let mut config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.features.enable(Feature::Sqlite);
+
+        let valid_uuid = Uuid::from_u128(9012);
+        let valid_thread_id =
+            ThreadId::from_string(&valid_uuid.to_string()).expect("valid thread id");
+        let valid_path = write_session_file(home.path(), "2025-01-03T13-00-00", valid_uuid)?;
+
+        let stale_uuid = Uuid::from_u128(9013);
+        let stale_thread_id =
+            ThreadId::from_string(&stale_uuid.to_string()).expect("valid thread id");
+        let stale_path = home.path().join(format!(
+            "sessions/2099/01/01/rollout-2099-01-01T00-00-00-{stale_uuid}.jsonl"
+        ));
+
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(None)
+            .await
+            .expect("backfill should be complete");
+
+        let stale_created_at = chrono::Utc
+            .with_ymd_and_hms(2025, 1, 4, 13, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let mut stale_builder = codex_state::ThreadMetadataBuilder::new(
+            stale_thread_id,
+            stale_path,
+            stale_created_at,
+            SessionSource::Cli,
+        );
+        stale_builder.model_provider = Some(config.model_provider_id.clone());
+        stale_builder.cwd = home.path().to_path_buf();
+        let mut stale_metadata = stale_builder.build(config.model_provider_id.as_str());
+        stale_metadata.first_user_message = Some("stale latest row".to_string());
+        runtime
+            .upsert_thread(&stale_metadata)
+            .await
+            .expect("state db upsert should succeed");
+
+        let valid_created_at = chrono::Utc
+            .with_ymd_and_hms(2025, 1, 3, 13, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let mut valid_builder = codex_state::ThreadMetadataBuilder::new(
+            valid_thread_id,
+            valid_path.clone(),
+            valid_created_at,
+            SessionSource::Cli,
+        );
+        valid_builder.model_provider = Some(config.model_provider_id.clone());
+        valid_builder.cwd = home.path().to_path_buf();
+        let mut valid_metadata = valid_builder.build(config.model_provider_id.as_str());
+        valid_metadata.first_user_message = Some("valid fallback row".to_string());
+        runtime
+            .upsert_thread(&valid_metadata)
+            .await
+            .expect("state db upsert should succeed");
+
+        let default_provider = config.model_provider_id.clone();
+        let latest = RolloutRecorder::find_latest_thread_path(
+            &config,
+            1,
+            None,
+            ThreadSortKey::CreatedAt,
+            &[],
+            None,
+            default_provider.as_str(),
+            None,
+        )
+        .await?;
+
+        assert_eq!(latest, Some(valid_path));
         Ok(())
     }
 
