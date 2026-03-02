@@ -271,7 +271,7 @@ async fn find_name_in_cwd_prefers_project_session_index() -> std::io::Result<()>
 }
 
 #[tokio::test]
-async fn find_name_in_cwd_falls_back_to_older_global_match() -> std::io::Result<()> {
+async fn find_name_in_cwd_falls_back_to_latest_global_match() -> std::io::Result<()> {
     let home = TempDir::new().unwrap();
     let thread_name = "shared-name";
 
@@ -288,11 +288,11 @@ async fn find_name_in_cwd_falls_back_to_older_global_match() -> std::io::Result<
     std::fs::create_dir_all(&dir_a)?;
     std::fs::create_dir_all(&dir_b)?;
 
-    let rollout_a = write_minimal_rollout_with_id_at(dir_a.as_path(), id_a, cwd_a.as_path());
-    let _rollout_b = write_minimal_rollout_with_id_at(dir_b.as_path(), id_b, cwd_b.as_path());
+    let _rollout_a = write_minimal_rollout_with_id_at(dir_a.as_path(), id_a, cwd_a.as_path());
+    let rollout_b = write_minimal_rollout_with_id_at(dir_b.as_path(), id_b, cwd_b.as_path());
 
-    // No project-local index for cwd_a, so lookup must fall back to global history.
-    // Newest global match points to cwd_b; older global match points to cwd_a.
+    // No project-local index for cwd_a, so lookup falls back to legacy global behavior,
+    // where the newest global name match wins even if it points to another project.
     let global_index = home.path().join("session_index.jsonl");
     std::fs::write(
         &global_index,
@@ -313,8 +313,8 @@ async fn find_name_in_cwd_falls_back_to_older_global_match() -> std::io::Result<
 
     let found = find_thread_path_by_name_str_in_cwd(home.path(), cwd_a.as_path(), thread_name)
         .await?
-        .expect("expected lookup to find an older global match for cwd");
-    assert_eq!(found, rollout_a);
+        .expect("expected lookup to find newest global name match");
+    assert_eq!(found, rollout_b);
     Ok(())
 }
 
