@@ -72,6 +72,9 @@ pub async fn append_project_session_index_entry(
     entry: &SessionIndexEntry,
 ) -> std::io::Result<()> {
     let path = project_session_index_path(codex_home, cwd);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -435,6 +438,21 @@ mod tests {
 
         let found = find_thread_names_by_ids(temp.path(), &ids).await?;
         assert_eq!(found, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_thread_name_creates_project_index_parent_dirs() -> std::io::Result<()> {
+        let temp = TempDir::new()?;
+        let cwd = Path::new("/workspace/project");
+        let thread_id = ThreadId::new();
+
+        append_thread_name(temp.path(), cwd, thread_id, "name").await?;
+
+        let project_index = project_session_index_path(temp.path(), cwd);
+        assert!(project_index.exists());
+        let contents = std::fs::read_to_string(project_index)?;
+        assert!(contents.contains("name"));
         Ok(())
     }
 
