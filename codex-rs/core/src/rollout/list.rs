@@ -889,7 +889,7 @@ async fn walk_rollout_files(
             continue;
         }
 
-        let mut cursor = NestedTimelineCursor::new(timeline_root).await?;
+        let mut cursor = NestedTimelineCursor::new(timeline_root);
         let root_idx = cursors.len();
         if let Some((ts, id, path)) = cursor.next().await? {
             frontier.push(TimelineCandidate {
@@ -948,6 +948,11 @@ impl PartialOrd for TimelineCandidate {
 }
 
 struct NestedTimelineCursor {
+    root: PathBuf,
+    year_dirs: Option<Vec<PathBuf>>,
+    next_year_idx: usize,
+    month_dirs: Vec<PathBuf>,
+    next_month_idx: usize,
     day_dirs: Vec<PathBuf>,
     next_day_idx: usize,
     day_files: Vec<(OffsetDateTime, Uuid, PathBuf)>,
@@ -955,13 +960,66 @@ struct NestedTimelineCursor {
 }
 
 impl NestedTimelineCursor {
-    async fn new(root: PathBuf) -> io::Result<Self> {
-        Ok(Self {
-            day_dirs: collect_nested_day_dirs_desc(root.as_path()).await?,
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            year_dirs: None,
+            next_year_idx: 0,
+            month_dirs: Vec::new(),
+            next_month_idx: 0,
+            day_dirs: Vec::new(),
             next_day_idx: 0,
             day_files: Vec::new(),
             next_file_idx: 0,
-        })
+        }
+    }
+
+    async fn next_day_dir(&mut self) -> io::Result<Option<PathBuf>> {
+        loop {
+            if self.next_day_idx < self.day_dirs.len() {
+                let day_path = self.day_dirs[self.next_day_idx].clone();
+                self.next_day_idx += 1;
+                return Ok(Some(day_path));
+            }
+
+            if self.next_month_idx < self.month_dirs.len() {
+                let month_path = self.month_dirs[self.next_month_idx].clone();
+                self.next_month_idx += 1;
+                self.day_dirs = collect_dirs_desc(month_path.as_path(), |s| s.parse::<u8>().ok())
+                    .await?
+                    .into_iter()
+                    .map(|(_, path)| path)
+                    .collect();
+                self.next_day_idx = 0;
+                continue;
+            }
+
+            if self.year_dirs.is_none() {
+                self.year_dirs = Some(
+                    collect_dirs_desc(self.root.as_path(), |s| s.parse::<u16>().ok())
+                        .await?
+                        .into_iter()
+                        .map(|(_, path)| path)
+                        .collect(),
+                );
+            }
+
+            let Some(year_dirs) = self.year_dirs.as_ref() else {
+                return Ok(None);
+            };
+            if self.next_year_idx >= year_dirs.len() {
+                return Ok(None);
+            }
+
+            let year_path = year_dirs[self.next_year_idx].clone();
+            self.next_year_idx += 1;
+            self.month_dirs = collect_dirs_desc(year_path.as_path(), |s| s.parse::<u8>().ok())
+                .await?
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            self.next_month_idx = 0;
+        }
     }
 
     async fn next(&mut self) -> io::Result<Option<(OffsetDateTime, Uuid, PathBuf)>> {
@@ -972,13 +1030,11 @@ impl NestedTimelineCursor {
                 return Ok(Some(item));
             }
 
-            if self.next_day_idx >= self.day_dirs.len() {
+            let Some(day_path) = self.next_day_dir().await? else {
                 return Ok(None);
-            }
+            };
 
-            self.day_files =
-                collect_rollout_day_files(self.day_dirs[self.next_day_idx].as_path()).await?;
-            self.next_day_idx += 1;
+            self.day_files = collect_rollout_day_files(day_path.as_path()).await?;
             self.next_file_idx = 0;
         }
     }
@@ -1003,21 +1059,6 @@ async fn collect_project_timeline_roots(root: &Path) -> io::Result<Vec<PathBuf>>
         }
     }
     Ok(project_roots)
-}
-
-async fn collect_nested_day_dirs_desc(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let year_dirs = collect_dirs_desc(root, |s| s.parse::<u16>().ok()).await?;
-    let mut day_dirs = Vec::new();
-    for (_year, year_path) in year_dirs {
-        let month_dirs = collect_dirs_desc(year_path.as_path(), |s| s.parse::<u8>().ok()).await?;
-        for (_month, month_path) in month_dirs {
-            let days = collect_dirs_desc(month_path.as_path(), |s| s.parse::<u8>().ok()).await?;
-            for (_day, day_path) in days {
-                day_dirs.push(day_path);
-            }
-        }
-    }
-    Ok(day_dirs)
 }
 
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
