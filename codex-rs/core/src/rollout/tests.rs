@@ -278,7 +278,22 @@ fn rollout_date_parts_extracts_directory_components() {
 fn project_slug_uses_path_segments() {
     let cwd = Path::new("/tmp/workspace/demo");
     let slug = crate::rollout::project_slug_for_cwd(cwd);
-    assert_eq!(slug, "-tmp-workspace-demo");
+    assert!(slug.starts_with("-tmp-workspace-demo--"));
+    assert_eq!(slug.len(), "-tmp-workspace-demo--".len() + 7);
+    assert_eq!(slug, crate::rollout::project_slug_for_cwd(cwd));
+}
+
+#[test]
+fn project_slug_hash_suffix_avoids_prefix_collisions() {
+    let dash_path = Path::new("/tmp/a-b");
+    let nested_path = Path::new("/tmp/a/b");
+
+    let slug_dash = crate::rollout::project_slug_for_cwd(dash_path);
+    let slug_nested = crate::rollout::project_slug_for_cwd(nested_path);
+
+    assert!(slug_dash.starts_with("-tmp-a-b--"));
+    assert!(slug_nested.starts_with("-tmp-a-b--"));
+    assert_ne!(slug_dash, slug_nested);
 }
 
 async fn assert_state_db_rollout_path(

@@ -3,6 +3,7 @@
 use codex_protocol::protocol::SessionSource;
 use std::path::Path;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
@@ -15,19 +16,31 @@ pub const INTERACTIVE_SESSION_SOURCES: &[SessionSource] =
 /// This mirrors the practical shape used by other coding tools:
 /// `/root/git/codex` -> `-root-git-codex`.
 pub fn project_slug_for_cwd(cwd: &Path) -> String {
+    // Normalize path first so semantically equivalent paths map to the same key.
+    let normalized_cwd =
+        crate::path_utils::normalize_for_path_comparison(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let normalized_cwd = normalized_cwd.to_string_lossy().into_owned();
+
+    // Keep a readable path-derived prefix.
     let mut slug = String::new();
-    for ch in cwd.to_string_lossy().chars() {
+    for ch in normalized_cwd.chars() {
         match ch {
             '/' | '\\' | ':' => slug.push('-'),
-            '\0' => slug.push('_'),
-            _ => slug.push(ch),
+            c if c.is_ascii_alphanumeric() => slug.push(c.to_ascii_lowercase()),
+            '-' | '_' | '.' => slug.push(ch),
+            _ => slug.push('-'),
         }
     }
     if slug.is_empty() {
-        "-".to_string()
-    } else {
-        slug
+        slug.push_str("project");
     }
+
+    // Add a short stable hash suffix to avoid collisions in the readable prefix.
+    // 7 hex chars gives 28 bits of space while keeping paths concise.
+    let hash_uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, normalized_cwd.as_bytes());
+    let hash_hex = hash_uuid.simple().to_string();
+    let short_hash = &hash_hex[..7];
+    format!("{slug}--{short_hash}")
 }
 
 pub fn project_sessions_root(codex_home: &Path, cwd: &Path) -> PathBuf {
